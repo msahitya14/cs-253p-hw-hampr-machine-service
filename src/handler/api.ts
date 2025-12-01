@@ -21,7 +21,11 @@ export class ApiHandler {
      * @throws An error if the token is invalid.
      */
     private checkToken(token: string) {
-        // Your implementation here
+        const idp = IdentityProviderClient.getInstance();
+        const valid = idp.validateToken(token);
+        if (!valid) {
+            throw JSON.stringify({ statusCode: HttpResponseCode.UNAUTHORIZED, message: 'Invalid token' });
+        }
     }
 
     /**
@@ -34,7 +38,24 @@ export class ApiHandler {
      * @returns A response model with the status code and the reserved machine's state.
      */
     private handleRequestMachine(request: RequestMachineRequestModel): MachineResponseModel {
-        // Your implementation here
+        const table = MachineStateTable.getInstance();
+        const machinesAtLocation = table.listMachinesAtLocation(request.locationId);
+        const available = machinesAtLocation.find(m => m.status === MachineStatus.AVAILABLE);
+        if (!available) {
+            return { statusCode: HttpResponseCode.NOT_FOUND, machine: undefined };
+        }
+
+        // Reserve the machine
+        table.updateMachineStatus(available.machineId, MachineStatus.AWAITING_DROPOFF);
+        table.updateMachineJobId(available.machineId, request.jobId);
+
+        const updated = table.getMachine(available.machineId);
+        if (updated) {
+            this.cache.put(updated.machineId, updated);
+            return { statusCode: HttpResponseCode.OK, machine: updated };
+        }
+
+        return { statusCode: HttpResponseCode.INTERNAL_SERVER_ERROR, machine: undefined };
     }
 
     /**
@@ -44,7 +65,19 @@ export class ApiHandler {
      * @returns A response model with the status code and the machine's state.
      */
     private handleGetMachine(request: GetMachineRequestModel): MachineResponseModel {
-        // Your implementation here
+        const cached = this.cache.get(request.machineId);
+        if (cached) {
+            return { statusCode: HttpResponseCode.OK, machine: cached };
+        }
+
+        const table = MachineStateTable.getInstance();
+        const machine = table.getMachine(request.machineId);
+        if (!machine) {
+            return { statusCode: HttpResponseCode.NOT_FOUND, machine: undefined };
+        }
+
+        this.cache.put(request.machineId, machine);
+        return { statusCode: HttpResponseCode.OK, machine };
     }
 
     /**
@@ -55,7 +88,37 @@ export class ApiHandler {
      * @returns A response model with the status code and the updated machine's state.
      */
     private handleStartMachine(request: StartMachineRequestModel): MachineResponseModel {
-        // Your implementation here
+        const table = MachineStateTable.getInstance();
+        const machine = table.getMachine(request.machineId);
+        if (!machine) {
+            return { statusCode: HttpResponseCode.NOT_FOUND, machine: undefined };
+        }
+
+        if (machine.status !== MachineStatus.AWAITING_DROPOFF) {
+            return { statusCode: HttpResponseCode.BAD_REQUEST, machine };
+        }
+
+        const client = SmartMachineClient.getInstance();
+        try {
+            client.startCycle(request.machineId);
+
+            table.updateMachineStatus(request.machineId, MachineStatus.RUNNING);
+            const updated = table.getMachine(request.machineId);
+            if (updated) {
+                this.cache.put(request.machineId, updated);
+                return { statusCode: HttpResponseCode.OK, machine: updated };
+            }
+
+            return { statusCode: HttpResponseCode.INTERNAL_SERVER_ERROR, machine: undefined };
+        } catch (err) {
+            table.updateMachineStatus(request.machineId, MachineStatus.ERROR);
+            const errored = table.getMachine(request.machineId);
+            if (errored) {
+                this.cache.put(request.machineId, errored);
+                return { statusCode: HttpResponseCode.HARDWARE_ERROR, machine: errored };
+            }
+            return { statusCode: HttpResponseCode.HARDWARE_ERROR, machine: undefined };
+        }
     }
 
     /**
